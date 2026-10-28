@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+Bulk URL shortener (tanpa dependensi eksternal, hanya Python 3.8+).
+
+Contoh pemakaian:
+    python bulk_shorten.py urls.txt                    # pakai is.gd (default)
+    python bulk_shorten.py urls.txt -o hasil.csv
+    python bulk_shorten.py urls.txt -p tinyurl --delay 1
+
+Format input: satu URL per baris (baris kosong dan baris diawali # diabaikan).
+Output: CSV dengan kolom original_url, short_url, status.
+"""
+
+import argparse
+import csv
+import json
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 15
+USER_AGENT = "bulk-shorten/1.0"
+
+
+def _get(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8").strip()
+
+
+def shorten_isgd(long_url: str) -> str:
+    api = "https://is.gd/create.php?format=json&url=" + urllib.parse.quote(long_url, safe="")
+    try:
+        data = json.loads(_get(api))
+    except urllib.error.HTTPError as e:
+        # is.gd mengembalikan JSON error di body (HTTP 400)
+        data = json.loads(e.read().decode("utf-8"))
+    if "shorturl" in data:
+        return data["shorturl"]
+    raise RuntimeError(data.get("errormessage", "unknown error"))
+
+
+def shorten_tinyurl(long_url: str) -> str:
+    api = "https://tinyurl.com/api-create.php?url=" + urllib.parse.quote(long_url, safe="")
+    result = _get(api)
+    if not result.startswith("http"):
+        raise RuntimeError(result)
+    return result
+
+
+PROVIDERS = {"isgd": shorten_isgd, "tinyurl": shorten_tinyurl}
+
+
+def read_urls(path: str):
+    seen = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            url = line.strip()
+            if not url or url.startswith("#") or url in seen:
+                continue
+            seen.add(url)
+            yield url
+
+
+def shorten_with_retry(fn, url: str, retries: int = 3, backoff: float = 2.0) -> str:
+    for attempt in range(1, retries + 1):
+        try:
+            return fn(url)
+        except Exception as e:  # noqa: BLE001
+            if attempt == retries:
+                raise
+            time.sleep(backoff * attempt)
+    raise RuntimeError("unreachable")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Bulk URL shortener")
+    ap.add_argument("input", help="file teks berisi daftar URL (satu per baris)")
+    ap.add_argument("-o", "--output", default="shortened.csv", help="file CSV output")
+    ap.add_argument("-p", "--provider", choices=PROVIDERS, default="isgd")
+    ap.add_argument("--delay", type=float, default=0.5, help="jeda antar request (detik)")
+    args = ap.parse_args()
+
+    fn = PROVIDERS[args.provider]
+    urls = list(read_urls(args.input))
+    if not urls:
+        sys.exit("Tidak ada URL di file input.")
+
+    ok = fail = 0
+    with open(args.output, "w", newline="", encoding="utf-8") as out:
+        writer = csv.writer(out)
+        writer.writerow(["original_url", "short_url", "status"])
+        for i, url in enumerate(urls, 1):
+            try:
+                short = shorten_with_retry(fn, url)
+                writer.writerow([url, short, "ok"])
+                ok += 1
+                print(f"[{i}/{len(urls)}] {url} -> {short}")
+            except Exception as e:  # noqa: BLE001
+                writer.writerow([url, "", f"error: {e}"])
+                fail += 1
+                print(f"[{i}/{len(urls)}] GAGAL {url}: {e}", file=sys.stderr)
+            out.flush()
+            time.sleep(args.delay)
+
+    print(f"\nSelesai. Berhasil: {ok}, gagal: {fail}. Hasil: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
